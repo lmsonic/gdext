@@ -307,13 +307,14 @@ impl Callable {
         // Could theoretically use `dyn` but would need:
         // - double boxing
         // - a type-erased workaround for PartialEq supertrait (which has a `Self` type parameter and thus is not object-safe)
-        let userdata = CallableUserdata { inner: callable };
+        let cached_callable = CachedRustCallable::new(callable);
+        let userdata = CallableUserdata::new(cached_callable);
 
         let info = CallableCustomInfo {
             // We could technically associate an object_id with the custom callable. is_valid_func would then check that for validity.
             callable_userdata: Box::into_raw(Box::new(userdata)) as *mut std::ffi::c_void,
             call_func: Some(rust_callable_call_custom::<C>),
-            free_func: Some(rust_callable_destroy::<C>),
+            free_func: Some(rust_callable_destroy::<CachedRustCallable<C>>),
             hash_func: Some(rust_callable_hash::<C>),
             equal_func: Some(rust_callable_equal::<C>),
             to_string_func: Some(rust_callable_to_string_display::<C>),
@@ -342,7 +343,7 @@ impl Callable {
         };
 
         let object_id = wrapper.linked_object_id();
-        let userdata = CallableUserdata { inner: wrapper };
+        let userdata = CallableUserdata::new(wrapper);
 
         let info = CallableCustomInfo {
             object_id,
@@ -607,11 +608,42 @@ mod custom_callable {
     }
 
     impl<T> CallableUserdata<T> {
+        pub fn new(inner: T) -> Self {
+            Self { inner }
+        }
+
         /// # Safety
         /// Returns an unbounded reference. `void_ptr` must be a valid pointer to a `CallableUserdata`.
         unsafe fn inner_from_raw<'a>(void_ptr: *mut std::ffi::c_void) -> &'a mut T {
             let ptr = void_ptr as *mut CallableUserdata<T>;
             &mut (*ptr).inner
+        }
+    }
+
+    /// Special wrapper for [`RustCallable`] based callables.
+    ///
+    /// Separate from [`CallableUserdata`] because closure-based callables don't need to pay for overhead.
+    pub(crate) struct CachedRustCallable<R: RustCallable> {
+        rust_callable: R,
+        cached_name: std::sync::OnceLock<String>,
+    }
+
+    impl<R: RustCallable> CachedRustCallable<R> {
+        pub fn new(inner: R) -> Self {
+            Self {
+                rust_callable: inner,
+                cached_name: std::sync::OnceLock::new(),
+            }
+        }
+
+        /// Gets or initializes the cached name lazily. The name is computed on first access by calling `to_string()` on the inner value.
+        pub fn get_name_lazy(&mut self) -> &str
+        where
+            R: fmt::Display,
+        {
+            self.cached_name
+                .get_or_init(|| self.rust_callable.to_string())
+                .as_str()
         }
     }
 
@@ -629,19 +661,6 @@ mod custom_callable {
         pub(crate) fn linked_object_id(&self) -> GDObjectInstanceID {
             self.linked_object_id.map(InstanceId::to_u64).unwrap_or(0)
         }
-    }
-
-    /// Returns the name for safeguard-enabled builds, or `"<optimized out>"` otherwise.
-    macro_rules! name_or_optimized {
-        ($($code:tt)*) => {
-            {
-                #[cfg(safeguards_balanced)]
-                { $($code)* }
-
-                #[cfg(not(safeguards_balanced))]
-                { "<optimized out>" }
-            }
-        };
     }
 
     /// Represents a custom callable object defined in Rust.
@@ -680,16 +699,19 @@ mod custom_callable {
     ) {
         let arg_refs: &[&Variant] = Variant::borrow_ref_slice(p_args, p_argument_count as usize);
 
-        let name = name_or_optimized! {
-            let c: &C = CallableUserdata::inner_from_raw(callable_userdata);
-            c.to_string()
+        // Initialize cached name lazily on first access.
+        let name = {
+            let cached: &mut CachedRustCallable<C> =
+                CallableUserdata::inner_from_raw(callable_userdata);
+            cached.get_name_lazy()
         };
-        let ctx = meta::CallContext::custom_callable(&name);
+        let ctx = meta::CallContext::custom_callable(name);
 
         crate::private::handle_fallible_varcall(&ctx, &mut *r_error, move || {
             // Get the RustCallable again inside closure so it doesn't have to be UnwindSafe.
-            let c: &mut C = CallableUserdata::inner_from_raw(callable_userdata);
-            let result = c.invoke(arg_refs);
+            let cached: &mut CachedRustCallable<C> =
+                CallableUserdata::inner_from_raw(callable_userdata);
+            let result = cached.rust_callable.invoke(arg_refs);
             meta::varcall_return_checked(Ok(result), r_return, r_error);
             Ok(())
         });
@@ -729,37 +751,38 @@ mod custom_callable {
         });
     }
 
+    /** `T` here is entire object stored in [`CallableUserdata`], not just the actual [`RustCallable`] or closure instance. */
     pub unsafe extern "C" fn rust_callable_destroy<T>(callable_userdata: *mut std::ffi::c_void) {
         let rust_ptr = callable_userdata as *mut CallableUserdata<T>;
         let _drop = Box::from_raw(rust_ptr);
     }
 
-    pub unsafe extern "C" fn rust_callable_hash<T: Hash>(
+    pub unsafe extern "C" fn rust_callable_hash<C: RustCallable + Hash>(
         callable_userdata: *mut std::ffi::c_void,
     ) -> u32 {
-        let c: &T = CallableUserdata::<T>::inner_from_raw(callable_userdata);
+        let cached: &CachedRustCallable<C> = CallableUserdata::inner_from_raw(callable_userdata);
 
         // Just cut off top bits, not best-possible hash.
-        sys::hash_value(c) as u32
+        sys::hash_value(&cached.rust_callable) as u32
     }
 
-    pub unsafe extern "C" fn rust_callable_equal<T: PartialEq>(
+    pub unsafe extern "C" fn rust_callable_equal<C: RustCallable + PartialEq>(
         callable_userdata_a: *mut std::ffi::c_void,
         callable_userdata_b: *mut std::ffi::c_void,
     ) -> sys::GDExtensionBool {
-        let a: &T = CallableUserdata::inner_from_raw(callable_userdata_a);
-        let b: &T = CallableUserdata::inner_from_raw(callable_userdata_b);
+        let a: &CachedRustCallable<C> = CallableUserdata::inner_from_raw(callable_userdata_a);
+        let b: &CachedRustCallable<C> = CallableUserdata::inner_from_raw(callable_userdata_b);
 
-        sys::conv::bool_to_sys(a == b)
+        sys::conv::bool_to_sys(a.rust_callable == b.rust_callable)
     }
 
-    pub unsafe extern "C" fn rust_callable_to_string_display<T: fmt::Display>(
+    pub unsafe extern "C" fn rust_callable_to_string_display<C: RustCallable + fmt::Display>(
         callable_userdata: *mut std::ffi::c_void,
         r_is_valid: *mut sys::GDExtensionBool,
         r_out: sys::GDExtensionStringPtr,
     ) {
-        let c: &T = CallableUserdata::inner_from_raw(callable_userdata);
-        let s = GString::from(&c.to_string());
+        let cached: &CachedRustCallable<C> = CallableUserdata::inner_from_raw(callable_userdata);
+        let s = GString::from(&cached.rust_callable.to_string());
 
         s.move_into_string_ptr(r_out);
         *r_is_valid = sys::conv::SYS_TRUE;
@@ -781,8 +804,9 @@ mod custom_callable {
     pub unsafe extern "C" fn rust_callable_is_valid_custom<C: RustCallable>(
         callable_userdata: *mut std::ffi::c_void,
     ) -> sys::GDExtensionBool {
-        let w: &mut C = CallableUserdata::inner_from_raw(callable_userdata);
-        let valid = w.is_valid();
+        let cached: &mut CachedRustCallable<C> =
+            CallableUserdata::inner_from_raw(callable_userdata);
+        let valid = cached.rust_callable.is_valid();
 
         sys::conv::bool_to_sys(valid)
     }
